@@ -16,10 +16,12 @@
 
 #include <cstdint>
 #include <math.h>
+#include <cmath>
+#include <thread>
+#include <mutex>
 #include <vector>
 #include <stdexcept>
 #include "cpu_sa.h"
-
 
 // xorshift128+ as defined https://en.wikipedia.org/wiki/Xorshift#xorshift.2B
 #define FASTRAND(rand) do {                       \
@@ -71,128 +73,217 @@ double get_flip_energy(
     return -2 * state[var] * energy;
 }
 
-// Performs a single run of simulated annealing with the given inputs.
-// @param state a int8 array where each int8 holds the state of a
-//        variable. Note that this will be used as the initial state of the
-//        run.
-// @param h vector of h or field value on each variable
-// @param degrees the degree of each variable
-// @param neighbors lists of the neighbors of each variable, such that 
-//        neighbors[i][j] is the jth neighbor of variable i. Note
-// @param neighbour_couplings same as neighbors, but instead has the J value.
-//        neighbour_couplings[i][j] is the J value or weight on the coupling
-//        between variables i and neighbors[i][j]. 
-// @param sweeps_per_beta The number of sweeps to perform at each beta value.
-//        Total number of sweeps is `sweeps_per_beta` * length of
-//        `beta_schedule`.
-// @param beta_schedule A list of the beta values to run `sweeps_per_beta`
-//        sweeps at.
-// @return Nothing, but `state` now contains the result of the run.
 template <VariableOrder varorder, Proposal proposal_acceptance_criteria>
 void simulated_annealing_run(
     std::int8_t* state,
-    const vector<double>& h,
-    const vector<int>& degrees,
-    const vector<vector<int>>& neighbors,
-    const vector<vector<double>>& neighbour_couplings,
+    const std::vector<double>& h,
+    const std::vector<int>& degrees,
+    const std::vector<std::vector<int>>& neighbors,
+    const std::vector<std::vector<double>>& neighbour_couplings,
     const int sweeps_per_beta,
-    const vector<double>& beta_schedule
+    const std::vector<double>& beta_schedule
 ) {
     const int num_vars = h.size();
+    const int num_threads = std::thread::hardware_concurrency();
 
-    // this double array will hold the delta energy for every variable
-    // delta_energy[v] is the delta energy for variable `v`
-    double *delta_energy = (double*)malloc(num_vars * sizeof(double));
+    // Allocate memory for delta_energy array
+    std::vector<double> delta_energy(num_vars);
 
-    uint64_t rand; // this will hold the value of the rng
-
-    // build the delta_energy array by getting the delta energy for each
-    // variable
+    // Initialize delta_energy array
     for (int var = 0; var < num_vars; var++) {
-        delta_energy[var] = get_flip_energy(var, state, h, degrees,
-                                            neighbors, neighbour_couplings);
+        delta_energy[var] = get_flip_energy(var, state, h, degrees, neighbors, neighbour_couplings);
     }
 
-    bool flip_spin;
-    // perform the sweeps
-    for (int beta_idx = 0; beta_idx < (int)beta_schedule.size(); beta_idx++) {
-        // get the beta value for this sweep
-        const double beta = beta_schedule[beta_idx];
-        for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+    // Mutex for synchronizing state and delta_energy updates
+    std::mutex state_mutex;
 
-            // this threshold will allow us to skip the metropolis update for
-            // variables that have zero chance of getting flipped.
-            // our RNG generates 64 bit integers, so we have a resolution of
-            // 1 / 2^64. since log(1 / 2^64) = -44.361, if the delta energy is
-            // greater than 44.361 / beta, then we can safely skip computing
-            // the probability.
-            const double threshold = 44.36142 / beta;
-            for (int varI = 0; varI < num_vars; varI++) {
-                int var;
-                if constexpr (varorder == Random) {
-                    FASTRAND(rand);
-                    var = rand%num_vars;
-                } else {
-                    var = varI;
-                }
-                if (delta_energy[var] >= threshold) continue;
-
-                flip_spin = false;
-
-                if constexpr (proposal_acceptance_criteria == Metropolis) {
-                    // Metropolis-Hastings acceptance rule
-                    if (delta_energy[var] <= 0.0) {
-                        // automatically accept any flip that results in a lower
-                        // energy
-                        flip_spin = true;
-                    } else {
-                        // get a random number, storing it in rand
+    auto worker = [&](int start, int end) {
+        for (int beta_idx = start; beta_idx < end; ++beta_idx) {
+            const double beta = beta_schedule[beta_idx];
+            for (int sweep = 0; sweep < sweeps_per_beta; ++sweep) {
+                const double threshold = 44.36142 / beta;
+                for (int varI = 0; varI < num_vars; ++varI) {
+                    int var;
+                    uint64_t rand;
+                    if constexpr (varorder == Random) {
                         FASTRAND(rand);
-                        // accept the flip if exp(-delta_energy*beta) > random(0, 1)
-                        if (exp(-delta_energy[var]*beta) * RANDMAX > rand) {
+                        var = rand % num_vars;
+                    } else {
+                        var = varI;
+                    }
+
+                    if (delta_energy[var] >= threshold) continue;
+
+                    bool flip_spin = false;
+                    if constexpr (proposal_acceptance_criteria == Metropolis) {
+                        if (delta_energy[var] <= 0.0) {
+                            flip_spin = true;
+                        } else {
+                            FASTRAND(rand);
+                            if (exp(-delta_energy[var] * beta) * RANDMAX > rand) {
+                                flip_spin = true;
+                            }
+                        }
+                    } else {
+                        FASTRAND(rand);
+                        if (RANDMAX > rand * (1 + exp(delta_energy[var] * beta))) {
                             flip_spin = true;
                         }
                     }
-                }
-                else {
-                    // Gibbs update: Sample fairly from the two available states,
-                    // independent of the current value
-                    FASTRAND(rand);
-                    if (RANDMAX > rand * (1+exp(delta_energy[var]*beta))) {
-                        flip_spin = true;
-                    }
-                }
 
-                if (flip_spin) {
-                    // since we have accepted the spin flip of variable `var`, 
-                    // we need to adjust the delta energies of all the 
-                    // neighboring variables
-                    const std::int8_t multiplier = 4 * state[var];
-                    // iterate over the neighbors of `var`
-                    for (int n_i = 0; n_i < degrees[var]; n_i++) {
-                        int neighbor = neighbors[var][n_i];
-                        // adjust the delta energy by 
-                        // 4 * `var` state * coupler weight * neighbor state
-                        // the 4 is because the original contribution from 
-                        // `var` to the neighbor's delta energy was
-                        // 2 * `var` state * coupler weight * neighbor state,
-                        // so since we are flipping `var`'s state, we need to 
-                        // multiply it again by 2 to get the full offset.
-                        delta_energy[neighbor] += multiplier * 
-                            neighbour_couplings[var][n_i] * state[neighbor];
-                    }
+                    if (flip_spin) {
+                        std::lock_guard<std::mutex> lock(state_mutex);
 
-                    // now we just need to flip its state and negate its delta 
-                    // energy
-                    state[var] *= -1;
-                    delta_energy[var] *= -1;
+                        const std::int8_t multiplier = 4 * state[var];
+                        for (int n_i = 0; n_i < degrees[var]; ++n_i) {
+                            int neighbor = neighbors[var][n_i];
+                            delta_energy[neighbor] += multiplier * neighbour_couplings[var][n_i] * state[neighbor];
+                        }
+
+                        state[var] *= -1;
+                        delta_energy[var] *= -1;
+                    }
                 }
             }
         }
+    };
+
+    std::vector<std::thread> threads;
+    int range = beta_schedule.size() / num_threads;
+    for (int i = 0; i < num_threads; ++i) {
+        int start = i * range;
+        int end = (i == num_threads - 1) ? beta_schedule.size() : (i + 1) * range;
+        threads.emplace_back(worker, start, end);
     }
 
-    free(delta_energy);
+    for (auto& t : threads) {
+        t.join();
+    }
 }
+
+
+//// Performs a single run of simulated annealing with the given inputs.
+//// @param state a int8 array where each int8 holds the state of a
+////        variable. Note that this will be used as the initial state of the
+////        run.
+//// @param h vector of h or field value on each variable
+//// @param degrees the degree of each variable
+//// @param neighbors lists of the neighbors of each variable, such that
+////        neighbors[i][j] is the jth neighbor of variable i. Note
+//// @param neighbour_couplings same as neighbors, but instead has the J value.
+////        neighbour_couplings[i][j] is the J value or weight on the coupling
+////        between variables i and neighbors[i][j].
+//// @param sweeps_per_beta The number of sweeps to perform at each beta value.
+////        Total number of sweeps is `sweeps_per_beta` * length of
+////        `beta_schedule`.
+//// @param beta_schedule A list of the beta values to run `sweeps_per_beta`
+////        sweeps at.
+//// @return Nothing, but `state` now contains the result of the run.
+//template <VariableOrder varorder, Proposal proposal_acceptance_criteria>
+//void simulated_annealing_run(
+//    std::int8_t* state,
+//    const vector<double>& h,
+//    const vector<int>& degrees,
+//    const vector<vector<int>>& neighbors,
+//    const vector<vector<double>>& neighbour_couplings,
+//    const int sweeps_per_beta,
+//    const vector<double>& beta_schedule
+//) {
+//    const int num_vars = h.size();
+//
+//    // this double array will hold the delta energy for every variable
+//    // delta_energy[v] is the delta energy for variable `v`
+//    double *delta_energy = (double*)malloc(num_vars * sizeof(double));
+//
+//    uint64_t rand; // this will hold the value of the rng
+//
+//    // build the delta_energy array by getting the delta energy for each
+//    // variable
+//    for (int var = 0; var < num_vars; var++) {
+//        delta_energy[var] = get_flip_energy(var, state, h, degrees,
+//                                            neighbors, neighbour_couplings);
+//    }
+//
+//    bool flip_spin;
+//    // perform the sweeps
+//    for (int beta_idx = 0; beta_idx < (int)beta_schedule.size(); beta_idx++) {
+//        // get the beta value for this sweep
+//        const double beta = beta_schedule[beta_idx];
+//        for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+//
+//            // this threshold will allow us to skip the metropolis update for
+//            // variables that have zero chance of getting flipped.
+//            // our RNG generates 64 bit integers, so we have a resolution of
+//            // 1 / 2^64. since log(1 / 2^64) = -44.361, if the delta energy is
+//            // greater than 44.361 / beta, then we can safely skip computing
+//            // the probability.
+//            const double threshold = 44.36142 / beta;
+//            for (int varI = 0; varI < num_vars; varI++) {
+//                int var;
+//                if constexpr (varorder == Random) {
+//                    FASTRAND(rand);
+//                    var = rand%num_vars;
+//                } else {
+//                    var = varI;
+//                }
+//                if (delta_energy[var] >= threshold) continue;
+//
+//                flip_spin = false;
+//
+//                if constexpr (proposal_acceptance_criteria == Metropolis) {
+//                    // Metropolis-Hastings acceptance rule
+//                    if (delta_energy[var] <= 0.0) {
+//                        // automatically accept any flip that results in a lower
+//                        // energy
+//                        flip_spin = true;
+//                    } else {
+//                        // get a random number, storing it in rand
+//                        FASTRAND(rand);
+//                        // accept the flip if exp(-delta_energy*beta) > random(0, 1)
+//                        if (exp(-delta_energy[var]*beta) * RANDMAX > rand) {
+//                            flip_spin = true;
+//                        }
+//                    }
+//                }
+//                else {
+//                    // Gibbs update: Sample fairly from the two available states,
+//                    // independent of the current value
+//                    FASTRAND(rand);
+//                    if (RANDMAX > rand * (1+exp(delta_energy[var]*beta))) {
+//                        flip_spin = true;
+//                    }
+//                }
+//
+//                if (flip_spin) {
+//                    // since we have accepted the spin flip of variable `var`,
+//                    // we need to adjust the delta energies of all the
+//                    // neighboring variables
+//                    const std::int8_t multiplier = 4 * state[var];
+//                    // iterate over the neighbors of `var`
+//                    for (int n_i = 0; n_i < degrees[var]; n_i++) {
+//                        int neighbor = neighbors[var][n_i];
+//                        // adjust the delta energy by
+//                        // 4 * `var` state * coupler weight * neighbor state
+//                        // the 4 is because the original contribution from
+//                        // `var` to the neighbor's delta energy was
+//                        // 2 * `var` state * coupler weight * neighbor state,
+//                        // so since we are flipping `var`'s state, we need to
+//                        // multiply it again by 2 to get the full offset.
+//                        delta_energy[neighbor] += multiplier *
+//                            neighbour_couplings[var][n_i] * state[neighbor];
+//                    }
+//
+//                    // now we just need to flip its state and negate its delta
+//                    // energy
+//                    state[var] *= -1;
+//                    delta_energy[var] *= -1;
+//                }
+//            }
+//        }
+//    }
+//
+//    free(delta_energy);
+//}
 
 // Returns the energy of a given state and problem
 // @param state a int8 array containing the spin state to compute the energy of
