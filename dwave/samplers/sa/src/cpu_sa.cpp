@@ -73,217 +73,128 @@ double get_flip_energy(
     return -2 * state[var] * energy;
 }
 
+// Performs a single run of simulated annealing with the given inputs.
+// @param state a int8 array where each int8 holds the state of a
+//        variable. Note that this will be used as the initial state of the
+//        run.
+// @param h vector of h or field value on each variable
+// @param degrees the degree of each variable
+// @param neighbors lists of the neighbors of each variable, such that
+//        neighbors[i][j] is the jth neighbor of variable i. Note
+// @param neighbour_couplings same as neighbors, but instead has the J value.
+//        neighbour_couplings[i][j] is the J value or weight on the coupling
+//        between variables i and neighbors[i][j].
+// @param sweeps_per_beta The number of sweeps to perform at each beta value.
+//        Total number of sweeps is `sweeps_per_beta` * length of
+//        `beta_schedule`.
+// @param beta_schedule A list of the beta values to run `sweeps_per_beta`
+//        sweeps at.
+// @return Nothing, but `state` now contains the result of the run.
 template <VariableOrder varorder, Proposal proposal_acceptance_criteria>
 void simulated_annealing_run(
     std::int8_t* state,
-    const std::vector<double>& h,
-    const std::vector<int>& degrees,
-    const std::vector<std::vector<int>>& neighbors,
-    const std::vector<std::vector<double>>& neighbour_couplings,
+    const vector<double>& h,
+    const vector<int>& degrees,
+    const vector<vector<int>>& neighbors,
+    const vector<vector<double>>& neighbour_couplings,
     const int sweeps_per_beta,
-    const std::vector<double>& beta_schedule
+    const vector<double>& beta_schedule
 ) {
     const int num_vars = h.size();
-    const int num_threads = std::thread::hardware_concurrency();
 
-    // Allocate memory for delta_energy array
-    std::vector<double> delta_energy(num_vars);
+    // this double array will hold the delta energy for every variable
+    // delta_energy[v] is the delta energy for variable `v`
+    double *delta_energy = (double*)malloc(num_vars * sizeof(double));
 
-    // Initialize delta_energy array
+    uint64_t rand; // this will hold the value of the rng
+
+    // build the delta_energy array by getting the delta energy for each
+    // variable
     for (int var = 0; var < num_vars; var++) {
-        delta_energy[var] = get_flip_energy(var, state, h, degrees, neighbors, neighbour_couplings);
+        delta_energy[var] = get_flip_energy(var, state, h, degrees,
+                                            neighbors, neighbour_couplings);
     }
 
-    // Mutex for synchronizing state and delta_energy updates
-    std::mutex state_mutex;
+    bool flip_spin;
+    // perform the sweeps
+    for (int beta_idx = 0; beta_idx < (int)beta_schedule.size(); beta_idx++) {
+        // get the beta value for this sweep
+        const double beta = beta_schedule[beta_idx];
+        for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
 
-    auto worker = [&](int start, int end) {
-        for (int beta_idx = start; beta_idx < end; ++beta_idx) {
-            const double beta = beta_schedule[beta_idx];
-            for (int sweep = 0; sweep < sweeps_per_beta; ++sweep) {
-                const double threshold = 44.36142 / beta;
-                for (int varI = 0; varI < num_vars; ++varI) {
-                    int var;
-                    uint64_t rand;
-                    if constexpr (varorder == Random) {
-                        FASTRAND(rand);
-                        var = rand % num_vars;
+            // this threshold will allow us to skip the metropolis update for
+            // variables that have zero chance of getting flipped.
+            // our RNG generates 64 bit integers, so we have a resolution of
+            // 1 / 2^64. since log(1 / 2^64) = -44.361, if the delta energy is
+            // greater than 44.361 / beta, then we can safely skip computing
+            // the probability.
+            const double threshold = 44.36142 / beta;
+            for (int varI = 0; varI < num_vars; varI++) {
+                int var;
+                if constexpr (varorder == Random) {
+                    FASTRAND(rand);
+                    var = rand%num_vars;
+                } else {
+                    var = varI;
+                }
+                if (delta_energy[var] >= threshold) continue;
+
+                flip_spin = false;
+
+                if constexpr (proposal_acceptance_criteria == Metropolis) {
+                    // Metropolis-Hastings acceptance rule
+                    if (delta_energy[var] <= 0.0) {
+                        // automatically accept any flip that results in a lower
+                        // energy
+                        flip_spin = true;
                     } else {
-                        var = varI;
-                    }
-
-                    if (delta_energy[var] >= threshold) continue;
-
-                    bool flip_spin = false;
-                    if constexpr (proposal_acceptance_criteria == Metropolis) {
-                        if (delta_energy[var] <= 0.0) {
-                            flip_spin = true;
-                        } else {
-                            FASTRAND(rand);
-                            if (exp(-delta_energy[var] * beta) * RANDMAX > rand) {
-                                flip_spin = true;
-                            }
-                        }
-                    } else {
+                        // get a random number, storing it in rand
                         FASTRAND(rand);
-                        if (RANDMAX > rand * (1 + exp(delta_energy[var] * beta))) {
+                        // accept the flip if exp(-delta_energy*beta) > random(0, 1)
+                        if (exp(-delta_energy[var]*beta) * RANDMAX > rand) {
                             flip_spin = true;
                         }
                     }
-
-                    if (flip_spin) {
-                        std::lock_guard<std::mutex> lock(state_mutex);
-
-                        const std::int8_t multiplier = 4 * state[var];
-                        for (int n_i = 0; n_i < degrees[var]; ++n_i) {
-                            int neighbor = neighbors[var][n_i];
-                            delta_energy[neighbor] += multiplier * neighbour_couplings[var][n_i] * state[neighbor];
-                        }
-
-                        state[var] *= -1;
-                        delta_energy[var] *= -1;
+                }
+                else {
+                    // Gibbs update: Sample fairly from the two available states,
+                    // independent of the current value
+                    FASTRAND(rand);
+                    if (RANDMAX > rand * (1+exp(delta_energy[var]*beta))) {
+                        flip_spin = true;
                     }
+                }
+
+                if (flip_spin) {
+                    // since we have accepted the spin flip of variable `var`,
+                    // we need to adjust the delta energies of all the
+                    // neighboring variables
+                    const std::int8_t multiplier = 4 * state[var];
+                    // iterate over the neighbors of `var`
+                    for (int n_i = 0; n_i < degrees[var]; n_i++) {
+                        int neighbor = neighbors[var][n_i];
+                        // adjust the delta energy by
+                        // 4 * `var` state * coupler weight * neighbor state
+                        // the 4 is because the original contribution from
+                        // `var` to the neighbor's delta energy was
+                        // 2 * `var` state * coupler weight * neighbor state,
+                        // so since we are flipping `var`'s state, we need to
+                        // multiply it again by 2 to get the full offset.
+                        delta_energy[neighbor] += multiplier *
+                            neighbour_couplings[var][n_i] * state[neighbor];
+                    }
+
+                    // now we just need to flip its state and negate its delta
+                    // energy
+                    state[var] *= -1;
+                    delta_energy[var] *= -1;
                 }
             }
         }
-    };
-
-    std::vector<std::thread> threads;
-    int range = beta_schedule.size() / num_threads;
-    for (int i = 0; i < num_threads; ++i) {
-        int start = i * range;
-        int end = (i == num_threads - 1) ? beta_schedule.size() : (i + 1) * range;
-        threads.emplace_back(worker, start, end);
     }
 
-    for (auto& t : threads) {
-        t.join();
-    }
+    free(delta_energy);
 }
-
-
-//// Performs a single run of simulated annealing with the given inputs.
-//// @param state a int8 array where each int8 holds the state of a
-////        variable. Note that this will be used as the initial state of the
-////        run.
-//// @param h vector of h or field value on each variable
-//// @param degrees the degree of each variable
-//// @param neighbors lists of the neighbors of each variable, such that
-////        neighbors[i][j] is the jth neighbor of variable i. Note
-//// @param neighbour_couplings same as neighbors, but instead has the J value.
-////        neighbour_couplings[i][j] is the J value or weight on the coupling
-////        between variables i and neighbors[i][j].
-//// @param sweeps_per_beta The number of sweeps to perform at each beta value.
-////        Total number of sweeps is `sweeps_per_beta` * length of
-////        `beta_schedule`.
-//// @param beta_schedule A list of the beta values to run `sweeps_per_beta`
-////        sweeps at.
-//// @return Nothing, but `state` now contains the result of the run.
-//template <VariableOrder varorder, Proposal proposal_acceptance_criteria>
-//void simulated_annealing_run(
-//    std::int8_t* state,
-//    const vector<double>& h,
-//    const vector<int>& degrees,
-//    const vector<vector<int>>& neighbors,
-//    const vector<vector<double>>& neighbour_couplings,
-//    const int sweeps_per_beta,
-//    const vector<double>& beta_schedule
-//) {
-//    const int num_vars = h.size();
-//
-//    // this double array will hold the delta energy for every variable
-//    // delta_energy[v] is the delta energy for variable `v`
-//    double *delta_energy = (double*)malloc(num_vars * sizeof(double));
-//
-//    uint64_t rand; // this will hold the value of the rng
-//
-//    // build the delta_energy array by getting the delta energy for each
-//    // variable
-//    for (int var = 0; var < num_vars; var++) {
-//        delta_energy[var] = get_flip_energy(var, state, h, degrees,
-//                                            neighbors, neighbour_couplings);
-//    }
-//
-//    bool flip_spin;
-//    // perform the sweeps
-//    for (int beta_idx = 0; beta_idx < (int)beta_schedule.size(); beta_idx++) {
-//        // get the beta value for this sweep
-//        const double beta = beta_schedule[beta_idx];
-//        for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
-//
-//            // this threshold will allow us to skip the metropolis update for
-//            // variables that have zero chance of getting flipped.
-//            // our RNG generates 64 bit integers, so we have a resolution of
-//            // 1 / 2^64. since log(1 / 2^64) = -44.361, if the delta energy is
-//            // greater than 44.361 / beta, then we can safely skip computing
-//            // the probability.
-//            const double threshold = 44.36142 / beta;
-//            for (int varI = 0; varI < num_vars; varI++) {
-//                int var;
-//                if constexpr (varorder == Random) {
-//                    FASTRAND(rand);
-//                    var = rand%num_vars;
-//                } else {
-//                    var = varI;
-//                }
-//                if (delta_energy[var] >= threshold) continue;
-//
-//                flip_spin = false;
-//
-//                if constexpr (proposal_acceptance_criteria == Metropolis) {
-//                    // Metropolis-Hastings acceptance rule
-//                    if (delta_energy[var] <= 0.0) {
-//                        // automatically accept any flip that results in a lower
-//                        // energy
-//                        flip_spin = true;
-//                    } else {
-//                        // get a random number, storing it in rand
-//                        FASTRAND(rand);
-//                        // accept the flip if exp(-delta_energy*beta) > random(0, 1)
-//                        if (exp(-delta_energy[var]*beta) * RANDMAX > rand) {
-//                            flip_spin = true;
-//                        }
-//                    }
-//                }
-//                else {
-//                    // Gibbs update: Sample fairly from the two available states,
-//                    // independent of the current value
-//                    FASTRAND(rand);
-//                    if (RANDMAX > rand * (1+exp(delta_energy[var]*beta))) {
-//                        flip_spin = true;
-//                    }
-//                }
-//
-//                if (flip_spin) {
-//                    // since we have accepted the spin flip of variable `var`,
-//                    // we need to adjust the delta energies of all the
-//                    // neighboring variables
-//                    const std::int8_t multiplier = 4 * state[var];
-//                    // iterate over the neighbors of `var`
-//                    for (int n_i = 0; n_i < degrees[var]; n_i++) {
-//                        int neighbor = neighbors[var][n_i];
-//                        // adjust the delta energy by
-//                        // 4 * `var` state * coupler weight * neighbor state
-//                        // the 4 is because the original contribution from
-//                        // `var` to the neighbor's delta energy was
-//                        // 2 * `var` state * coupler weight * neighbor state,
-//                        // so since we are flipping `var`'s state, we need to
-//                        // multiply it again by 2 to get the full offset.
-//                        delta_energy[neighbor] += multiplier *
-//                            neighbour_couplings[var][n_i] * state[neighbor];
-//                    }
-//
-//                    // now we just need to flip its state and negate its delta
-//                    // energy
-//                    state[var] *= -1;
-//                    delta_energy[var] *= -1;
-//                }
-//            }
-//        }
-//    }
-//
-//    free(delta_energy);
-//}
 
 // Returns the energy of a given state and problem
 // @param state a int8 array containing the spin state to compute the energy of
@@ -326,7 +237,7 @@ double get_state_energy(
 // @param h vector of h or field value on each variable
 // @param coupler_starts an int vector containing the variables of one side of
 //        each coupler in the problem
-// @param coupler_ends an int vector containing the variables of the other side 
+// @param coupler_ends an int vector containing the variables of the other side
 //        of each coupler in the problem
 // @param coupler_weights a double vector containing the weights of the couplers
 //        in the same order as coupler_starts and coupler_ends
@@ -343,109 +254,246 @@ int general_simulated_annealing(
     std::int8_t* states,
     double* energies,
     const int num_samples,
-    const vector<double> h,
-    const vector<int> coupler_starts,
-    const vector<int> coupler_ends,
-    const vector<double> coupler_weights,
+    const std::vector<double> h,
+    const std::vector<int> coupler_starts,
+    const std::vector<int> coupler_ends,
+    const std::vector<double> coupler_weights,
     const int sweeps_per_beta,
-    const vector<double> beta_schedule,
+    const std::vector<double> beta_schedule,
     const uint64_t seed,
     const VariableOrder varorder,
     const Proposal proposal_acceptance_criteria,
-    callback interrupt_callback,
-    void * const interrupt_function
+    bool (*interrupt_callback)(void*),
+    void* const interrupt_function
 ) {
-    // TODO 
-    // assert len(states) == num_samples*num_vars*sizeof(int8_t)
-    // assert len(coupler_starts) == len(coupler_ends) == len(coupler_weights)
-    // assert max(coupler_starts + coupler_ends) < num_vars
-    
-    // the number of variables in the problem
+    // Validate input sizes
     const int num_vars = h.size();
     if (!((coupler_starts.size() == coupler_ends.size()) &&
                 (coupler_starts.size() == coupler_weights.size()))) {
-        throw runtime_error("coupler vectors have mismatched lengths");
+        throw std::runtime_error("coupler vectors have mismatched lengths");
     }
-    
-    // set the seed of the RNG
-    // note that xorshift+ requires a non-zero seed
+
+    // Set the seed for the RNG
     rng_state[0] = seed ? seed : RANDMAX;
     rng_state[1] = 0;
 
-    // degrees will be a vector of the degrees of each variable
-    vector<int> degrees(num_vars, 0);
-    // neighbors is a vector of vectors, such that neighbors[i][j] is the jth
-    // neighbor of variable i
-    vector<vector<int>> neighbors(num_vars);
-    // neighbour_couplings is another vector of vectors with the same structure
-    // except neighbour_couplings[i][j] is the weight on the coupling between i
-    // and its jth neighbor
-    vector<vector<double>> neighbour_couplings(num_vars);
+    // Initialize degrees, neighbors, and neighbour_couplings vectors
+    std::vector<int> degrees(num_vars, 0);
+    std::vector<std::vector<int>> neighbors(num_vars);
+    std::vector<std::vector<double>> neighbour_couplings(num_vars);
 
-    // build the degrees, neighbors, and neighbour_couplings vectors by
-    // iterating over the inputted coupler vectors
+    // Build the degrees, neighbors, and neighbour_couplings vectors
     for (unsigned int cplr = 0; cplr < coupler_starts.size(); cplr++) {
         int u = coupler_starts[cplr];
         int v = coupler_ends[cplr];
 
         if ((u < 0) || (v < 0) || (u >= num_vars) || (v >= num_vars)) {
-            throw runtime_error("coupler indexes contain an invalid variable");
+            throw std::runtime_error("coupler indexes contain an invalid variable");
         }
 
-        // add v to u's neighbors list and vice versa
         neighbors[u].push_back(v);
         neighbors[v].push_back(u);
-        // add the weights
         neighbour_couplings[u].push_back(coupler_weights[cplr]);
         neighbour_couplings[v].push_back(coupler_weights[cplr]);
 
-        // increase the degrees of both variables
         degrees[u]++;
         degrees[v]++;
     }
 
-
-    // get the simulated annealing samples
+    std::mutex mtx;
     int sample = 0;
-    while (sample < num_samples) {
-        // states is a giant spin array that will hold the resulting states for
-        // all the samples, so we need to get the location inside that vector
-        // where we will store the sample for this sample
-        std::int8_t *state = states + sample*num_vars;
-        // then do the actual sample. this function will modify state, storing
-        // the sample there
-	// Branching here is designed to make expicit compile time optimizations
-        if (varorder == Random) {
-            if (proposal_acceptance_criteria == Metropolis) {
-                simulated_annealing_run<Random, Metropolis>(state, h, degrees,
-                                                    neighbors, neighbour_couplings,
-                                                    sweeps_per_beta, beta_schedule);
+    bool interrupted = false;
+    const int num_threads = std::thread::hardware_concurrency();
+
+    auto worker = [&](int thread_id) {
+        while (true) {
+            int local_sample;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                if (sample >= num_samples || interrupted) {
+                    return;
+                }
+                local_sample = sample++;
+            }
+
+            std::int8_t* state = states + local_sample * num_vars;
+
+            if (varorder == Random) {
+                if (proposal_acceptance_criteria == Metropolis) {
+                    simulated_annealing_run<Random, Metropolis>(state, h, degrees,
+                                                                neighbors, neighbour_couplings,
+                                                                sweeps_per_beta, beta_schedule);
+                } else {
+                    simulated_annealing_run<Random, Gibbs>(state, h, degrees,
+                                                           neighbors, neighbour_couplings,
+                                                           sweeps_per_beta, beta_schedule);
+                }
             } else {
-                simulated_annealing_run<Random, Gibbs>(state, h, degrees,
-                                                     neighbors, neighbour_couplings,
-                                                     sweeps_per_beta, beta_schedule);
-          }
-        } else {
-            if (proposal_acceptance_criteria == Metropolis) {
-                simulated_annealing_run<Sequential, Metropolis>(state, h, degrees,
-                                                     neighbors, neighbour_couplings,
-                                                     sweeps_per_beta, beta_schedule);
-            } else {
-                simulated_annealing_run<Sequential, Gibbs>(state, h, degrees,
-                                                      neighbors, neighbour_couplings,
-                                                      sweeps_per_beta, beta_schedule);
+                if (proposal_acceptance_criteria == Metropolis) {
+                    simulated_annealing_run<Sequential, Metropolis>(state, h, degrees,
+                                                                    neighbors, neighbour_couplings,
+                                                                    sweeps_per_beta, beta_schedule);
+                } else {
+                    simulated_annealing_run<Sequential, Gibbs>(state, h, degrees,
+                                                               neighbors, neighbour_couplings,
+                                                               sweeps_per_beta, beta_schedule);
+                }
+            }
+
+            energies[local_sample] = get_state_energy(state, h, coupler_starts, coupler_ends, coupler_weights);
+
+            if (interrupt_function && interrupt_callback(interrupt_function)) {
+                std::lock_guard<std::mutex> lock(mtx);
+                interrupted = true;
+                return;
             }
         }
-        // compute the energy of the sample and store it in `energies`
-        energies[sample] = get_state_energy(state, h, coupler_starts, 
-                                            coupler_ends, coupler_weights);
+    };
 
-        sample++;
-
-        // if interrupt_function returns true, stop sampling
-        if (interrupt_function && interrupt_callback(interrupt_function)) break;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker, i);
     }
 
-    // return the number of samples we actually took
+    for (auto& t : threads) {
+        t.join();
+    }
+
     return sample;
 }
+
+
+//// Perform simulated annealing on a general problem
+//// @param states a int8 array of size num_samples * number of variables in the
+////        problem. Will be overwritten by this function as samples are filled
+////        in. The initial state of the samples are used to seed the simulated
+////        annealing runs.
+//// @param energies a double array of size num_samples. Will be overwritten by
+////        this function as energies are filled in.
+//// @param num_samples the number of samples to get.
+//// @param h vector of h or field value on each variable
+//// @param coupler_starts an int vector containing the variables of one side of
+////        each coupler in the problem
+//// @param coupler_ends an int vector containing the variables of the other side
+////        of each coupler in the problem
+//// @param coupler_weights a double vector containing the weights of the couplers
+////        in the same order as coupler_starts and coupler_ends
+//// @param sweeps_per_beta The number of sweeps to perform at each beta value.
+////        Total number of sweeps is `sweeps_per_beta` * length of
+////        `beta_schedule`.
+//// @param beta_schedule A list of the beta values to run `sweeps_per_beta`
+////        sweeps at.
+//// @param interrupt_callback A function that is invoked between each run of simulated annealing
+////        if the function returns True then it will stop running.
+//// @param interrupt_function A pointer to contents that are passed to interrupt_callback.
+//// @return the number of samples taken. If no interrupt occured, will equal num_samples.
+//int general_simulated_annealing(
+//    std::int8_t* states,
+//    double* energies,
+//    const int num_samples,
+//    const vector<double> h,
+//    const vector<int> coupler_starts,
+//    const vector<int> coupler_ends,
+//    const vector<double> coupler_weights,
+//    const int sweeps_per_beta,
+//    const vector<double> beta_schedule,
+//    const uint64_t seed,
+//    const VariableOrder varorder,
+//    const Proposal proposal_acceptance_criteria,
+//    callback interrupt_callback,
+//    void * const interrupt_function
+//) {
+//    // TODO
+//    // assert len(states) == num_samples*num_vars*sizeof(int8_t)
+//    // assert len(coupler_starts) == len(coupler_ends) == len(coupler_weights)
+//    // assert max(coupler_starts + coupler_ends) < num_vars
+//
+//    // the number of variables in the problem
+//    const int num_vars = h.size();
+//    if (!((coupler_starts.size() == coupler_ends.size()) &&
+//                (coupler_starts.size() == coupler_weights.size()))) {
+//        throw runtime_error("coupler vectors have mismatched lengths");
+//    }
+//
+//    // set the seed of the RNG
+//    // note that xorshift+ requires a non-zero seed
+//    rng_state[0] = seed ? seed : RANDMAX;
+//    rng_state[1] = 0;
+//
+//    // degrees will be a vector of the degrees of each variable
+//    vector<int> degrees(num_vars, 0);
+//    // neighbors is a vector of vectors, such that neighbors[i][j] is the jth
+//    // neighbor of variable i
+//    vector<vector<int>> neighbors(num_vars);
+//    // neighbour_couplings is another vector of vectors with the same structure
+//    // except neighbour_couplings[i][j] is the weight on the coupling between i
+//    // and its jth neighbor
+//    vector<vector<double>> neighbour_couplings(num_vars);
+//
+//    // build the degrees, neighbors, and neighbour_couplings vectors by
+//    // iterating over the inputted coupler vectors
+//    for (unsigned int cplr = 0; cplr < coupler_starts.size(); cplr++) {
+//        int u = coupler_starts[cplr];
+//        int v = coupler_ends[cplr];
+//
+//        if ((u < 0) || (v < 0) || (u >= num_vars) || (v >= num_vars)) {
+//            throw runtime_error("coupler indexes contain an invalid variable");
+//        }
+//
+//        // add v to u's neighbors list and vice versa
+//        neighbors[u].push_back(v);
+//        neighbors[v].push_back(u);
+//        // add the weights
+//        neighbour_couplings[u].push_back(coupler_weights[cplr]);
+//        neighbour_couplings[v].push_back(coupler_weights[cplr]);
+//
+//        // increase the degrees of both variables
+//        degrees[u]++;
+//        degrees[v]++;
+//    }
+//
+//
+//    // get the simulated annealing samples
+//    int sample = 0;
+//    while (sample < num_samples) {
+//        // states is a giant spin array that will hold the resulting states for
+//        // all the samples, so we need to get the location inside that vector
+//        // where we will store the sample for this sample
+//        std::int8_t *state = states + sample*num_vars;
+//        // then do the actual sample. this function will modify state, storing
+//        // the sample there
+//	// Branching here is designed to make expicit compile time optimizations
+//        if (varorder == Random) {
+//            if (proposal_acceptance_criteria == Metropolis) {
+//                simulated_annealing_run<Random, Metropolis>(state, h, degrees,
+//                                                    neighbors, neighbour_couplings,
+//                                                    sweeps_per_beta, beta_schedule);
+//            } else {
+//                simulated_annealing_run<Random, Gibbs>(state, h, degrees,
+//                                                     neighbors, neighbour_couplings,
+//                                                     sweeps_per_beta, beta_schedule);
+//          }
+//        } else {
+//            if (proposal_acceptance_criteria == Metropolis) {
+//                simulated_annealing_run<Sequential, Metropolis>(state, h, degrees,
+//                                                     neighbors, neighbour_couplings,
+//                                                     sweeps_per_beta, beta_schedule);
+//            } else {
+//                simulated_annealing_run<Sequential, Gibbs>(state, h, degrees,
+//                                                      neighbors, neighbour_couplings,
+//                                                      sweeps_per_beta, beta_schedule);
+//            }
+//        }
+//        // compute the energy of the sample and store it in `energies`
+//        energies[sample] = get_state_energy(state, h, coupler_starts,
+//                                            coupler_ends, coupler_weights);
+//
+//        sample++;
+//
+//        // if interrupt_function returns true, stop sampling
+//        if (interrupt_function && interrupt_callback(interrupt_function)) break;
+//    }
+//
+//    // return the number of samples we actually took
+//    return sample;
+//}
